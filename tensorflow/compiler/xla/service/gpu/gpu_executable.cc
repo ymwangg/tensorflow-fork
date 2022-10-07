@@ -30,7 +30,7 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/synchronization/mutex.h"
 #include "mlir/IR/DialectRegistry.h"  // from @llvm-project
-#include "mlir/Parser/Parser.h"  // from @llvm-project
+#include "mlir/Parser/Parser.h"       // from @llvm-project
 #include "tensorflow/compiler/xla/map_util.h"
 #include "tensorflow/compiler/xla/mlir/transforms/runtime/compilation_pipeline_gpu.h"
 #include "tensorflow/compiler/xla/runtime/diagnostics.h"
@@ -366,6 +366,17 @@ Status ExecuteThunks(const std::string& module_name,
         *run_options, buffer_allocations, main_stream,
         async_comms_stream.ok() ? async_comms_stream->get() : nullptr};
     TF_RETURN_IF_ERROR(thunk->ExecuteOnStream(thunk_params));
+
+    // GPU multi-stream is currently not supported. We need to make
+    // exeuctions on async_comms_stream blocking to avoid race condition.
+    if (async_comms_stream.ok() && NeedsAsyncCommsStream(*thunk)) {
+      Status block_status = async_comms_stream->get()->BlockHostUntilDone();
+      if (!block_status.ok()) {
+        return InternalError(
+            "Failed to complete all kernels launched on stream %p: %s",
+            async_comms_stream->get(), block_status.error_message());
+      }
+    }
   }
   return MaybeSyncAndProfile(run_options, start_micros,
                              block_host_until_done ? main_stream : nullptr);
