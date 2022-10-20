@@ -2127,6 +2127,7 @@ xla_test(
         "gpu",
         "cpu",
     ],
+    data = ["all-reduce.hlo"],
     deps = [
         ":client_library_test_base",
         ":hlo_test_base",

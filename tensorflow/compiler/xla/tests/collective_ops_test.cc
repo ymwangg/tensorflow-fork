@@ -25,9 +25,12 @@ limitations under the License.
 #include "tensorflow/compiler/xla/tests/hlo_test_base.h"
 #include "tensorflow/compiler/xla/tests/literal_test_util.h"
 #include "tensorflow/compiler/xla/tests/test_macros.h"
+#include "tensorflow/compiler/xla/tests/test_utils.h"
 #include "tensorflow/tsl/lib/core/status_test_util.h"
 #include "tensorflow/tsl/platform/blocking_counter.h"
 #include "tensorflow/tsl/platform/env.h"
+#include "tensorflow/tsl/platform/path.h"
+#include "tensorflow/tsl/platform/resource_loader.h"
 #include "tensorflow/tsl/platform/threadpool.h"
 
 // Tests cross-GPU operations.
@@ -1314,6 +1317,99 @@ XLA_TEST_F(CollectiveOpsTest,
                                              {13, 14, 15},
                                              {13, 14, 15}}},
                                            results[0]);
+}
+
+XLA_TEST_F(CollectiveOpsTest, DISABLED_ON_CPU(AllReduceRaceCondition)) {
+  const char* const kModuleStr = R"(
+  HloModule m
+  sum {
+    a = f32[] parameter(0)
+    b = f32[] parameter(1)
+    ROOT add.2 = f32[] add(a, b)
+  }
+
+  ENTRY main {
+    c0 = f32[8] constant({  1,  2,  3,  4,  5,  6,  7,  8})
+    c1 = f32[8] constant({ 11, 12, 13, 14, 15, 16, 17, 18})
+    c2 = f32[8] constant({  2,  3,  4,  5,  6,  7,  8,  9})
+    c3 = f32[8] constant({ 12, 13, 14, 15, 16, 17, 18, 19})
+    zero = u32[] constant(0)
+    id = u32[] replica-id()
+    p = pred[] compare(id, zero), direction=EQ
+    pb = pred[8] broadcast(p), dimensions={}
+    // data0 = c0 for replica 0 and c1 for replica 1
+    data0 = f32[8] select(pb, c0, c1)
+    // data1 = c2 for replica 0 and c3 for replica 1
+    data1 = f32[8] select(pb, c2, c3)
+
+    ar0 = f32[8] all-reduce(data0), replica_groups={}, to_apply=sum
+    ar1 = f32[8] all-reduce(data1), replica_groups={}, to_apply=sum
+    ROOT add = f32[8] add(ar0, ar1)
+  }
+  )";
+  se::Platform* platform = GetTestPlatform();
+  for (int i = 0; i < platform->VisibleDeviceCount(); i++) {
+  }
+
+  std::cout << platform->Name() << std::endl;
+  tsl::Env* env = tsl::Env::Default();
+  std::string contents;
+  const std::string& filename =
+      tsl::GetDataDependencyFilepath(tsl::io::JoinPath(
+          "tensorflow", "compiler", "xla", "tests", "all-reduce.hlo"));
+  TF_CHECK_OK(tsl::ReadFileToString(env, filename, &contents));
+
+  const int64_t kNumReplicas = 2;
+  auto config = GetModuleConfigForTest(kNumReplicas);
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(contents, config));
+  auto module_copy = module->Clone();
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Executable> executable,
+      test_runner_.CreateExecutable(std::move(module_copy),
+                                    /*run_hlo_passes=*/true));
+  std::cout << "done compilation" << std::endl;
+  std::vector<int64_t> devices = {0, 1};
+  auto device_assn = MakeDeviceAssn(devices);
+  std::cout << "make device assn" << std::endl;
+
+  for (int i = 0; i < 100; i++) {
+    HloRunner::ReplicatedExecuteOptions options;
+    options.num_replicas = devices.size();
+    options.use_threads = true;
+
+    auto fake_arguments = MakeFakeArguments(module.get()).value();
+    absl::c_transform(fake_arguments, std::back_inserter(options.arguments),
+                      [](const Literal& literal) {
+                        // std::cout << literal.ToString() << std::endl;
+                        return const_cast<Literal*>(&literal);
+                      });
+    std::cout << "Num arg" << fake_arguments.size() << std::endl;
+    TF_ASSERT_OK_AND_ASSIGN(std::vector<Literal> results,
+                            test_runner_.ExecuteReplicated(
+                                executable.get(), options, &device_assn));
+    std::cout << "running" << std::endl;
+    const ErrorSpec es{1e-5, 1e-5};
+    // EXPECT_TRUE(LiteralTestUtil::NearOrEqual(results[0], results[1], es));
+    EXPECT_TRUE(LiteralTestUtil::Equal(results[0], results[1]));
+  }
+
+  // for (int repeat = 0; repeat < 100; repeat++) {
+  //   std::cout << "repeat = " << repeat << std::endl;
+
+  //   std::cout << "anchor 0" << std::endl;
+  //   TF_ASSERT_OK_AND_ASSIGN(
+  //       std::vector<Literal> results,
+  //       ExecuteReplicated(executable.get(), fake_argument_ptrs, kNumReplicas,
+  //                         /*use_threads=*/true, /*run_hlo_passes=*/true));
+
+  //   std::cout << results.size() << std::endl;
+  //   const ErrorSpec es{1e-5, 1e-5};
+  //   EXPECT_TRUE(LiteralTestUtil::NearOrEqual(results[0], results[1], es));
+  // }
+
+  // LiteralTestUtil::ExpectR1Near<float>(
+  //     {26.0, 30.0, 34.0, 38.0, 42.0, 46.0, 50.0, 54.0}, results[0], es);
 }
 
 }  // namespace
